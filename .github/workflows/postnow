@@ -1,0 +1,97 @@
+name: Bluesky Auto Poster
+
+on:
+  schedule:
+    - cron: "0 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      account_row:
+        description: >
+          OPTIONAL. Leave blank to auto-run every eligible account row from
+          workflow.xlsx (up to MAX_ACCOUNTS_PER_RUN, if set). Fill in a single
+          row number to force this run onto just that one row.
+        required: false
+        default: ""
+      max_accounts:
+        description: >
+          OPTIONAL. Overrides the Settings-sheet MAX_ACCOUNTS_PER_RUN cap for
+          this run only. Leave blank to use the xlsx setting (or run every
+          eligible account if that's blank too).
+        required: false
+        default: ""
+
+concurrency:
+  group: bluesky-poster
+  cancel-in-progress: false
+
+jobs:
+  # ── Step 1: figure out which account rows run this time ──────────────────
+  discover-accounts:
+    runs-on: ubuntu-latest
+    outputs:
+      rows: ${{ steps.discover.outputs.rows }}
+      count: ${{ steps.discover.outputs.count }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v4
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: pip install openpyxl atproto Pillow requests beautifulsoup4
+      - name: Install rclone
+        run: |
+          curl https://rclone.org/install.sh | sudo bash
+          rclone version
+      - name: Write rclone config (Mega)
+        run: echo "$MEGA_RCLONE_CONF" > rclone.conf
+        env:
+          MEGA_RCLONE_CONF: ${{ secrets.MEGA_RCLONE_CONF }}
+      - name: Discover eligible accounts
+        id: discover
+        run: python -u postnow_status_post.py --discover
+        env:
+          RCLONE_CONFIG_PATH: rclone.conf
+          RCLONE_REMOTE_NAME: mega
+          WORKFLOW_XLSX_PATH: ${{ secrets.WORKFLOW_XLSX_PATH || 'workflow.xlsx' }}
+          FORCE_ACCOUNT_ROW: ${{ github.event.inputs.account_row }}
+          MAX_ACCOUNTS_PER_RUN: ${{ github.event.inputs.max_accounts }}
+      - name: Clean up
+        if: always()
+        run: rm -f rclone.conf
+
+  # ── Step 2: one job per eligible account, run in parallel ────────────────
+  post:
+    needs: discover-accounts
+    if: needs.discover-accounts.outputs.count != '0'
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    strategy:
+      fail-fast: false
+      matrix:
+        account_row: ${{ fromJson(format('[{0}]', needs.discover-accounts.outputs.rows)) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v4
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: pip install openpyxl atproto Pillow requests beautifulsoup4
+      - name: Install rclone
+        run: |
+          curl https://rclone.org/install.sh | sudo bash
+          rclone version
+      - name: Write rclone config (Mega)
+        run: echo "$MEGA_RCLONE_CONF" > rclone.conf
+        env:
+          MEGA_RCLONE_CONF: ${{ secrets.MEGA_RCLONE_CONF }}
+      - name: Run poster loop for this account
+        run: python -u postnow_status_post.py
+        env:
+          PYTHONUNBUFFERED: "1"
+          RCLONE_CONFIG_PATH: rclone.conf
+          RCLONE_REMOTE_NAME: mega
+          WORKFLOW_XLSX_PATH: ${{ secrets.WORKFLOW_XLSX_PATH || 'workflow.xlsx' }}
+          ACCOUNT_ROW: ${{ matrix.account_row }}
+      - name: Clean up
+        if: always()
+        run: rm -f rclone.conf
