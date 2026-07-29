@@ -3,9 +3,34 @@
 Bluesky auto-poster.
 
 Coordination data (Credentials / Settings / PostPlan / LinkPlan / Report)
-lives in a Google Sheet, written via the Sheets API — every write is a
-targeted single-cell or single-row call, not a whole-file re-upload, so
-parallel account jobs can't clobber each other's changes.
+lives in a SINGLE .xlsx WORKBOOK stored on Mega (via rclone) — not Google
+Sheets. Because Mega has no per-cell API, every write means "download the
+whole file, change it, upload the whole file back". To make that safe across
+several parallel account jobs, all reads-that-lead-to-writes are wrapped in
+one real distributed lock:
+
+    1. Try to atomically claim a lock marker on Mega with `rclone moveto`
+       (the exact same atomic-rename trick already used to claim media
+       files below — a moveto either fully succeeds or fully fails, so two
+       runners can never both "win" the same rename).
+    2. Once the lock is held: download the freshest copy of the workbook,
+       make the change, upload it, then move the lock marker back
+       (release). This whole cycle is kept as short as possible — no
+       Bluesky API calls, HTTP fetches, or file downloads ever happen while
+       the lock is held.
+    3. If a runner crashes while holding the lock, the marker is left
+       "held" forever, so lock acquisition also does TTL-based staleness
+       detection: if a held marker is older than WORKBOOK_LOCK_TTL_SECONDS,
+       any other runner may attempt to steal it (again via an atomic
+       moveto — only one thief can ever succeed).
+
+This is a lot more moving parts than a real database transaction, and it is
+NOT as robust as using an actual application with row-level locking (a
+real DB, or Google Sheets' per-cell API) would be — concurrent writes are
+still serialized through a single file, so throughput is limited and a
+sufficiently badly-timed crash mid-upload could still corrupt the workbook.
+But it removes the Google Sheets dependency entirely and keeps everything,
+including all coordination state, on Mega.
 
 Media files (images/videos) still live on Mega, accessed via rclone,
 unchanged from before.
@@ -20,21 +45,20 @@ import subprocess
 import sys
 import time
 import uuid
+from datetime import datetime
 from urllib.parse import urljoin
 
 import requests
 from bs4 import BeautifulSoup
 from atproto import Client, models
 from atproto_client.utils import TextBuilder
-from google.oauth2.service_account import Credentials as SACredentials
-from googleapiclient.discovery import build
-from googleapiclient.errors import HttpError
+import openpyxl
 
 RUN_TAG      = os.getenv("GITHUB_RUN_ID") or f"{socket.gethostname()}-{uuid.uuid4().hex[:8]}"
 CLAIM_PREFIX = "CLAIMED_"
 
 CURRENT_REPO     = os.getenv("GITHUB_REPOSITORY") or f"local-{socket.gethostname()}"
-LOCK_TTL_MINUTES = 45
+LOCK_TTL_MINUTES = 45   # business-level "which repo owns this account row" heartbeat TTL
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  ENV / VALUE PARSING HELPERS
@@ -163,7 +187,7 @@ DEFAULT_LOOP_INTERVAL_SECONDS = 1800
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  RCLONE HELPERS (media files only — unchanged)
+#  RCLONE HELPERS (used for both media files and the state workbook/lock)
 # ═══════════════════════════════════════════════════════════════════════════
 
 def _rclone_run(args, timeout=120):
@@ -179,255 +203,315 @@ def rclone_list_files(remote_folder):
         return []
     return [line.strip() for line in result.stdout.splitlines() if line.strip()]
 
+def rclone_lsjson(remote_folder):
+    result = _rclone_run(["lsjson", remote_folder])
+    if result.returncode != 0:
+        return []
+    try:
+        return json.loads(result.stdout)
+    except Exception:
+        return []
+
 def rclone_claim(remote_folder, name):
     claimed_name = f"{CLAIM_PREFIX}{RUN_TAG}__{name}"
     result = _rclone_run(["moveto", f"{remote_folder}/{name}", f"{remote_folder}/{claimed_name}"])
     return claimed_name if result.returncode == 0 else None
 
-def rclone_download(remote_folder, filename, local_path):
-    result = _rclone_run(["copyto", f"{remote_folder}/{filename}", local_path])
+def rclone_download(remote_folder, filename, local_path, timeout=120):
+    result = _rclone_run(["copyto", f"{remote_folder}/{filename}", local_path], timeout=timeout)
     return result.returncode == 0
 
-def rclone_move(src, dst):
-    result = _rclone_run(["moveto", src, dst])
+def rclone_move(src, dst, timeout=120):
+    result = _rclone_run(["moveto", src, dst], timeout=timeout)
     return result.returncode == 0
 
-def rclone_copyto(src, dst):
-    result = _rclone_run(["copyto", src, dst])
+def rclone_copyto(src, dst, timeout=120):
+    result = _rclone_run(["copyto", src, dst], timeout=timeout)
     return result.returncode == 0
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  GOOGLE SHEETS — low-level API layer
+#  MEGA STATE-WORKBOOK LOCATION
 # ═══════════════════════════════════════════════════════════════════════════
 
-SHEETS_SCOPES  = ["https://www.googleapis.com/auth/spreadsheets"]
-SPREADSHEET_ID = get_env("GOOGLE_SHEET_ID")
+# Path to the single .xlsx workbook on Mega that holds Credentials / Settings /
+# Report / PostPlan / LinkPlan, e.g. "AutoPoster/state.xlsx".
+MEGA_STATE_PATH        = get_env("MEGA_STATE_PATH")
+MEGA_STATE_REMOTE_NAME = get_env("MEGA_STATE_REMOTE_NAME", required=False) or RCLONE_REMOTE_NAME
 
-_sheets_svc = None
+WORKBOOK_LOCK_TTL_SECONDS             = get_int_env("WORKBOOK_LOCK_TTL_SECONDS", 300)
+WORKBOOK_LOCK_ACQUIRE_TIMEOUT_SECONDS = get_int_env("WORKBOOK_LOCK_ACQUIRE_TIMEOUT_SECONDS", 240)
+WORKBOOK_LOCK_POLL_SECONDS            = get_int_env("WORKBOOK_LOCK_POLL_SECONDS", 4)
 
-def _sheets_service():
-    global _sheets_svc
-    if _sheets_svc is not None:
-        return _sheets_svc
-    raw = get_env("GOOGLE_SERVICE_ACCOUNT_JSON")
-    info = json.loads(raw)
-    creds = SACredentials.from_service_account_info(info, scopes=SHEETS_SCOPES)
-    _sheets_svc = build("sheets", "v4", credentials=creds, cache_discovery=False)
-    return _sheets_svc
-
-def _retry(request_factory, *args, retries=5, **kwargs):
-    for attempt in range(1, retries + 1):
-        try:
-            return request_factory(*args, **kwargs).execute()
-        except HttpError as exc:
-            status = getattr(exc.resp, "status", None)
-            if status in (429, 500, 502, 503) and attempt < retries:
-                wait = 2 ** attempt
-                print(f"  Sheets API {status} — retry {attempt}/{retries} in {wait}s…")
-                time.sleep(wait)
-                continue
-            raise
-
-def _col_letter(n):
-    letters = ""
-    while n > 0:
-        n, rem = divmod(n - 1, 26)
-        letters = chr(65 + rem) + letters
-    return letters
-
-def _get_tab_values(tab):
-    svc = _sheets_service()
-    resp = _retry(svc.spreadsheets().values().get, spreadsheetId=SPREADSHEET_ID, range=f"'{tab}'")
-    return resp.get("values", [])
-
-def _update_cell(tab, row, col, value):
-    svc = _sheets_service()
-    rng = f"'{tab}'!{_col_letter(col)}{row}"
-    _retry(svc.spreadsheets().values().update, spreadsheetId=SPREADSHEET_ID, range=rng,
-           valueInputOption="RAW", body={"values": [[value]]})
-
-def _update_row(tab, row, values_list):
-    svc = _sheets_service()
-    rng = f"'{tab}'!A{row}:{_col_letter(len(values_list))}{row}"
-    _retry(svc.spreadsheets().values().update, spreadsheetId=SPREADSHEET_ID, range=rng,
-           valueInputOption="RAW", body={"values": [values_list]})
-
-def _append_row_api(tab, values_list):
-    svc = _sheets_service()
-    _retry(svc.spreadsheets().values().append, spreadsheetId=SPREADSHEET_ID, range=f"'{tab}'!A1",
-           valueInputOption="RAW", insertDataOption="INSERT_ROWS", body={"values": [values_list]})
-
-_tab_titles_cache = None
-
-def _spreadsheet_tab_titles(force=False):
-    global _tab_titles_cache
-    if _tab_titles_cache is not None and not force:
-        return _tab_titles_cache
-    svc = _sheets_service()
-    meta = _retry(svc.spreadsheets().get, spreadsheetId=SPREADSHEET_ID)
-    _tab_titles_cache = [s["properties"]["title"] for s in meta["sheets"]]
-    return _tab_titles_cache
-
-def ensure_tab(tab, header=None):
-    """Create the tab if it doesn't exist yet; write the header row if it's missing."""
-    titles = _spreadsheet_tab_titles()
-    if tab not in titles:
-        svc = _sheets_service()
-        _retry(svc.spreadsheets().batchUpdate, spreadsheetId=SPREADSHEET_ID,
-               body={"requests": [{"addSheet": {"properties": {"title": tab}}}]})
-        _spreadsheet_tab_titles(force=True)
-        if header:
-            _update_row(tab, 1, header)
-        return
-    if header:
-        rows = _get_tab_values(tab)
-        if not rows or not rows[0]:
-            _update_row(tab, 1, header)
+STATE_LOCAL_PATH = "/tmp/_state_workbook.xlsx"
 
 
-class SheetTab:
-    """Cached read + targeted-write access to one tab of the Google Sheet.
-
-    Reads are cached in memory (like the old in-memory workbook). Writes go
-    straight to the Sheets API as single-cell/row calls — there is no
-    whole-file save/upload step, so concurrent writers to other rows/tabs
-    never get clobbered.
-    """
-    _cache = {}
-
-    def __init__(self, name):
-        self.name = name
-
-    def rows(self, force=False):
-        if force or self.name not in SheetTab._cache:
-            SheetTab._cache[self.name] = _get_tab_values(self.name)
-        return SheetTab._cache[self.name]
-
-    def invalidate(self):
-        SheetTab._cache.pop(self.name, None)
-
-    def max_row(self):
-        return len(self.rows())
-
-    def cell(self, row, col):
-        rows = self.rows()
-        if row - 1 >= len(rows):
-            return ""
-        r = rows[row - 1]
-        if col - 1 >= len(r):
-            return ""
-        v = r[col - 1]
-        return str(v).strip() if v is not None else ""
-
-    def header_map(self):
-        header = {}
-        rows = self.rows()
-        if rows:
-            for i, v in enumerate(rows[0], start=1):
-                if v is not None and str(v).strip():
-                    header[str(v).strip().upper()] = i
-        return header
-
-    def set_cell(self, row, col, value):
-        _update_cell(self.name, row, col, value)
-        rows = self.rows()
-        while len(rows) < row:
-            rows.append([])
-        r = rows[row - 1]
-        while len(r) < col:
-            r.append("")
-        r[col - 1] = value
-
-    def append_row(self, values_list):
-        _append_row_api(self.name, values_list)
-        self.invalidate()
+def _remote_join(remote_dir, name):
+    """Join an rclone remote directory (e.g. 'mega:folder' or 'mega:') with a filename."""
+    if remote_dir.endswith(":") or remote_dir.endswith("/"):
+        return f"{remote_dir}{name}"
+    return f"{remote_dir}/{name}"
 
 
-def ensure_settings_defaults():
-    ensure_tab(SETTINGS_TAB, header=["KEY", "VALUE"])
-    tab = SheetTab(SETTINGS_TAB)
-    rows = tab.rows(force=True)
-    existing = {str(r[0]).strip().upper() for r in rows[1:] if r and r[0]}
-    for k, v in DEFAULT_SETTINGS:
-        if k not in existing:
-            tab.append_row([k, v])
+def _split_remote_path(remote_name, path):
+    path = path.strip("/")
+    if "/" in path:
+        d, f = path.rsplit("/", 1)
+        return f"{remote_name}:{d}", f
+    return f"{remote_name}:", path
+
+
+STATE_REMOTE_DIR, STATE_FILENAME = _split_remote_path(MEGA_STATE_REMOTE_NAME, MEGA_STATE_PATH)
+STATE_REMOTE_FULL = _remote_join(STATE_REMOTE_DIR, STATE_FILENAME)
+LOCK_FILENAME     = STATE_FILENAME + ".lock"           # marker name when the lock is FREE
+LOCK_HELD_PREFIX  = LOCK_FILENAME + ".held."           # marker prefix + RUN_TAG when HELD
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  AUTO ACCOUNT-ROW ASSIGNMENT
+#  REAL DISTRIBUTED LOCK ON MEGA (atomic rename via `rclone moveto`)
 # ═══════════════════════════════════════════════════════════════════════════
 
-def resolve_account_row():
-    explicit = get_env("ACCOUNT_ROW", required=False)
-    if explicit:
-        row = _parse_int(explicit, 1)
-        print(f"ACCOUNT_ROW={row} was explicitly set — using it as a manual override "
-              f"(auto-assignment skipped).")
-        return row
+_RCLONE_TS_RE = re.compile(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(\.\d+)?(Z|[+-]\d{2}:\d{2})?$")
 
-    tab = SheetTab(CREDS_TAB)
-    tab.rows(force=True)
-    header = tab.header_map()
-
-    def hidx(*names):
-        for n in names:
-            if n.upper() in header:
-                return header[n.upper()]
+def _parse_rclone_time(s):
+    if not s:
+        return None
+    m = _RCLONE_TS_RE.match(s.strip())
+    if not m:
+        return None
+    base, _frac, tz = m.groups()
+    iso = base + (tz if tz and tz != "Z" else "+00:00")
+    try:
+        return datetime.fromisoformat(iso).timestamp()
+    except Exception:
         return None
 
-    handle_col = hidx("BSKY_HANDLE")
-    repo_col   = hidx("ASSIGNED_REPO")
-    status_col = hidx("ASSIGNED_STATUS")
-    at_col     = hidx("ASSIGNED_AT")
 
-    if handle_col is None or repo_col is None or status_col is None:
-        raise RuntimeError(
-            f"Auto row-assignment needs 'BSKY_HANDLE', 'ASSIGNED_REPO' and "
-            f"'ASSIGNED_STATUS' columns in '{CREDS_TAB}'. Add any missing ones "
-            f"to the header row, or set ACCOUNT_ROW manually for this run."
+class MegaLock:
+    """A real cross-process lock backed by an atomic Mega file rename.
+
+    Steady state: exactly one file exists, either
+      - <name>.lock              (FREE), or
+      - <name>.lock.held.<tag>   (HELD by whichever runner's tag is in the name)
+
+    Acquiring = `rclone moveto <free> <held-by-me>`. This is atomic: if two
+    runners race, only one `moveto` can possibly succeed (the source
+    disappears the instant the winner's rename lands), so there is no
+    check-then-act gap for a normal handoff.
+
+    If a runner dies while holding the lock, the `.held.<tag>` marker is
+    orphaned forever. Any other runner may steal an orphaned marker once
+    it's older than `ttl_seconds`, again via an atomic moveto — so at most
+    one thief ever wins that race too.
+    """
+
+    def __init__(self, remote_dir, lock_filename, owner, ttl_seconds, acquire_timeout, poll_interval):
+        self.remote_dir  = remote_dir.rstrip("/") if not remote_dir.endswith(":") else remote_dir
+        self.free_path   = _remote_join(self.remote_dir, lock_filename)
+        self.held_prefix = f"{lock_filename}.held."
+        self.owner       = owner
+        self.ttl         = ttl_seconds
+        self.timeout     = acquire_timeout
+        self.poll        = poll_interval
+        self._held_path  = None
+
+    def _held_path_for(self, tag):
+        return _remote_join(self.remote_dir, f"{self.held_prefix}{tag}")
+
+    def _find_held_entry(self):
+        for item in rclone_lsjson(self.remote_dir):
+            name = item.get("Name", "")
+            if name.startswith(self.held_prefix):
+                return item
+        return None
+
+    def _bootstrap_if_nothing_exists(self):
+        """One-time, best-effort: if neither a free nor a held marker exists
+        anywhere (i.e. this is the very first run ever), create the free
+        marker so normal acquire/steal logic has something to work with.
+        There's an unavoidable small race window here on the true first run
+        only — recommend triggering one manual run before turning on the
+        schedule to get past it safely."""
+        entries = rclone_lsjson(self.remote_dir)
+        names = {e.get("Name") for e in entries}
+        lock_filename = self.free_path.rsplit("/", 1)[-1]
+        has_free = lock_filename in names
+        has_held = any(n.startswith(self.held_prefix) for n in names)
+        if not has_free and not has_held:
+            tmp = f"/tmp/_lockinit_{uuid.uuid4().hex}"
+            open(tmp, "w").close()
+            rclone_copyto(tmp, self.free_path)
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+
+    def acquire(self):
+        deadline = time.time() + self.timeout
+        attempt = 0
+        while True:
+            attempt += 1
+            my_held = self._held_path_for(self.owner)
+
+            if rclone_move(self.free_path, my_held):
+                self._held_path = my_held
+                return True
+
+            entry = self._find_held_entry()
+            if entry:
+                ts = _parse_rclone_time(entry.get("ModTime"))
+                stale = ts is None or (time.time() - ts) > self.ttl
+                if stale:
+                    stale_path = _remote_join(self.remote_dir, entry["Name"])
+                    if rclone_move(stale_path, my_held):
+                        print(f"[workbook-lock] reclaimed stale lock '{entry['Name']}' "
+                              f"(idle > {self.ttl}s).")
+                        self._held_path = my_held
+                        return True
+            else:
+                self._bootstrap_if_nothing_exists()
+
+            if time.time() >= deadline:
+                raise TimeoutError(
+                    f"Could not acquire the workbook lock within {self.timeout}s "
+                    f"(another runner is holding it and it isn't stale yet)."
+                )
+            wait = self.poll + random.uniform(0, self.poll)
+            print(f"[workbook-lock] attempt {attempt}: busy, retrying in {wait:.1f}s…")
+            time.sleep(wait)
+
+    def release(self):
+        if not self._held_path:
+            return
+        if not rclone_move(self._held_path, self.free_path):
+            print("Warning: could not cleanly release the workbook lock — "
+                  "another runner may have force-reclaimed it as stale. "
+                  "This is recoverable but worth keeping an eye on.")
+        self._held_path = None
+
+    def __enter__(self):
+        self.acquire()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.release()
+        return False
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  WORKBOOK-LEVEL HELPERS (openpyxl worksheet access, 1-based like the sheet was)
+# ═══════════════════════════════════════════════════════════════════════════
+
+def ws_header_map(ws):
+    header = {}
+    if ws.max_row >= 1:
+        for i, cell in enumerate(ws[1], start=1):
+            v = cell.value
+            if v is not None and str(v).strip():
+                header[str(v).strip().upper()] = i
+    return header
+
+def ws_cell(ws, row, col):
+    if col is None:
+        return ""
+    v = ws.cell(row=row, column=col).value
+    return str(v).strip() if v is not None else ""
+
+def ws_set_cell(ws, row, col, value):
+    ws.cell(row=row, column=col, value=value)
+
+
+REQUIRED_TABS = {
+    CREDS_TAB:    CREDENTIALS_HEADER,
+    SETTINGS_TAB: ["KEY", "VALUE"],
+    REPORT_TAB:   REPORT_HEADER,
+}
+
+
+class WorkbookStore:
+    """The single .xlsx workbook on Mega, accessed either as:
+      - snapshot(): an unlocked, best-effort-fresh read-only download. Fine
+        for pure reads (settings, scanning PostPlan/LinkPlan) where a lost
+        update isn't possible because nothing gets written back.
+      - transact(fn): acquire the distributed lock, download the freshest
+        copy, run fn(wb) -> (dirty: bool, result), upload only if dirty,
+        release the lock. This is the ONLY path allowed to write, and it's
+        kept as short as possible on purpose — no network calls other than
+        the download/upload happen while the lock is held.
+    """
+
+    def __init__(self):
+        self.lock = MegaLock(
+            STATE_REMOTE_DIR, LOCK_FILENAME, owner=RUN_TAG,
+            ttl_seconds=WORKBOOK_LOCK_TTL_SECONDS,
+            acquire_timeout=WORKBOOK_LOCK_ACQUIRE_TIMEOUT_SECONDS,
+            poll_interval=WORKBOOK_LOCK_POLL_SECONDS,
         )
+        self.wb = None
+        self._dirty = False
 
-    max_row = tab.max_row()
+    def _download(self):
+        ok = rclone_download(STATE_REMOTE_DIR, STATE_FILENAME, STATE_LOCAL_PATH)
+        created_new = not (ok and os.path.exists(STATE_LOCAL_PATH))
+        if created_new:
+            # Build fresh in-memory rather than saving/reloading an empty
+            # workbook — openpyxl refuses to save a workbook with zero
+            # sheets, and we haven't added the required tabs yet.
+            self.wb = openpyxl.Workbook()
+            self.wb.remove(self.wb.active)
+            print(f"Note: '{STATE_REMOTE_FULL}' doesn't exist yet on Mega — "
+                  f"starting a brand-new workbook.")
+        else:
+            self.wb = openpyxl.load_workbook(STATE_LOCAL_PATH)
+        self._dirty = created_new
+        self._ensure_required_tabs()
 
-    for data_idx in range(1, max_row):
-        excel_row = data_idx + 1
-        if tab.cell(excel_row, repo_col) == CURRENT_REPO:
-            handle = tab.cell(excel_row, handle_col)
-            print(f"Repo '{CURRENT_REPO}' already owns Credentials row {data_idx} "
-                  f"({handle or 'no handle'}) — reusing it.")
-            return data_idx
+    def _ensure_required_tabs(self):
+        for tab, header in REQUIRED_TABS.items():
+            if tab not in self.wb.sheetnames:
+                ws = self.wb.create_sheet(tab)
+                ws.append(header)
+                self._dirty = True
+            else:
+                ws = self.wb[tab]
+                if ws.max_row < 1 or all((c.value in (None, "")) for c in ws[1]):
+                    for i, h in enumerate(header, start=1):
+                        ws.cell(row=1, column=i, value=h)
+                    self._dirty = True
 
-    for data_idx in range(1, max_row):
-        excel_row = data_idx + 1
-        handle_val = tab.cell(excel_row, handle_col)
-        status_val = tab.cell(excel_row, status_col)
-        if not handle_val:
-            continue
-        if status_val.lower() == ASSIGN_STATUS_IN_USE.lower():
-            continue
-        if _claim_account_row(tab, excel_row, repo_col, status_col, at_col):
-            print(f"Claimed Credentials row {data_idx} ({handle_val}) for repo '{CURRENT_REPO}'.")
-            return data_idx
-        print(f"Lost claim race on Credentials row {data_idx}; trying the next available row.")
+    def _upload(self):
+        self.wb.save(STATE_LOCAL_PATH)
+        if not rclone_copyto(STATE_LOCAL_PATH, STATE_REMOTE_FULL):
+            raise RuntimeError(
+                "Failed to upload the workbook back to Mega — the lock will "
+                "still be released, but this write did not make it, so a "
+                "retry (of whatever operation this was) is a good idea."
+            )
 
-    raise RuntimeError(
-        f"No available account rows left in '{CREDS_TAB}' — every configured "
-        f"row is already marked '{ASSIGN_STATUS_IN_USE}'. Add a new account "
-        f"row, or clear ASSIGNED_REPO/ASSIGNED_STATUS on one you want to free up."
-    )
+    def snapshot(self):
+        self._download()
+        return self.wb
+
+    def transact(self, fn):
+        with self.lock:
+            self._download()
+            result = fn(self.wb)
+            if isinstance(result, tuple) and len(result) == 2 and isinstance(result[0], bool):
+                dirty, ret = result
+            else:
+                dirty, ret = True, result
+            if dirty or self._dirty:
+                self._upload()
+            return ret
 
 
-def _claim_account_row(tab, excel_row, repo_col, status_col, at_col):
-    now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-    tab.set_cell(excel_row, repo_col, CURRENT_REPO)
-    tab.set_cell(excel_row, status_col, ASSIGN_STATUS_IN_USE)
-    if at_col is not None:
-        tab.set_cell(excel_row, at_col, now)
-    # Re-read to confirm the claim actually stuck — protects against another
-    # job claiming the same row in the same instant.
-    tab.rows(force=True)
-    return tab.cell(excel_row, repo_col) == CURRENT_REPO
+STORE = WorkbookStore()
+
+
+def bootstrap_state():
+    """Force one transaction so the workbook file + required tabs definitely
+    exist on Mega, even on a completely fresh setup."""
+    STORE.transact(lambda wb: (True, None))
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -435,10 +519,6 @@ def _claim_account_row(tab, excel_row, repo_col, status_col, at_col):
 # ═══════════════════════════════════════════════════════════════════════════
 
 _account_config         = None
-_creds_lock_col_by      = None
-_creds_lock_col_at      = None
-_creds_status_col       = None
-_creds_status_at_col    = None
 _global_settings_cache  = None
 
 
@@ -449,13 +529,11 @@ def load_global_settings(force_refresh=False):
 
     settings = {}
     try:
-        tab = SheetTab(SETTINGS_TAB)
-        rows = tab.rows(force=force_refresh)
-        for r in rows[1:]:
-            if not r:
-                continue
-            key = str(r[0]).strip() if len(r) > 0 and r[0] is not None else ""
-            val = str(r[1]).strip() if len(r) > 1 and r[1] is not None else ""
+        wb = STORE.snapshot()
+        ws = wb[SETTINGS_TAB]
+        for r in range(2, ws.max_row + 1):
+            key = ws_cell(ws, r, 1)
+            val = ws_cell(ws, r, 2)
             if key:
                 settings[key.upper()] = val
     except Exception as exc:
@@ -465,36 +543,46 @@ def load_global_settings(force_refresh=False):
     return _global_settings_cache
 
 
+def ensure_settings_defaults():
+    def _mut(wb):
+        ws = wb[SETTINGS_TAB]
+        existing = set()
+        for r in range(2, ws.max_row + 1):
+            k = ws_cell(ws, r, 1)
+            if k:
+                existing.add(k.upper())
+        dirty = False
+        for k, v in DEFAULT_SETTINGS:
+            if k not in existing:
+                ws.append([k, v])
+                dirty = True
+        return dirty, None
+    STORE.transact(_mut)
+
+
 def load_account_config(force_refresh=False):
-    global _account_config, _creds_lock_col_by, _creds_lock_col_at
-    global _creds_status_col, _creds_status_at_col
+    global _account_config
 
     if _account_config is not None and not force_refresh:
         return _account_config
 
-    tab = SheetTab(CREDS_TAB)
-    tab.rows(force=force_refresh)
-    header = tab.header_map()
+    wb = STORE.snapshot()
+    ws = wb[CREDS_TAB]
+    header = ws_header_map(ws)
 
-    # ACCOUNT_ROW is 1-based data index → sheet row = ACCOUNT_ROW + 1
     excel_row = ACCOUNT_ROW + 1
-    if excel_row > tab.max_row():
+    if excel_row > ws.max_row:
         raise RuntimeError(
             f"ACCOUNT_ROW={ACCOUNT_ROW} but '{CREDS_TAB}' only has "
-            f"{max(0, tab.max_row() - 1)} data row(s)."
+            f"{max(0, ws.max_row - 1)} data row(s)."
         )
 
     def col(*names):
         for n in names:
             c = header.get(n.upper())
             if c is not None:
-                return tab.cell(excel_row, c)
+                return ws_cell(ws, excel_row, c)
         return ""
-
-    _creds_lock_col_by   = header.get("LOCKED_BY")
-    _creds_lock_col_at   = header.get("LOCKED_AT")
-    _creds_status_col    = header.get("ACCOUNT_STATUS")
-    _creds_status_at_col = header.get("ACCOUNT_STATUS_AT")
 
     shared = load_global_settings(force_refresh)
     def setting(key):
@@ -551,6 +639,7 @@ def load_account_config(force_refresh=False):
         "locked_by": col("LOCKED_BY"),
         "locked_at": col("LOCKED_AT"),
         "account_status": col("ACCOUNT_STATUS"),
+        "has_lock_columns": ("LOCKED_BY" in header and "LOCKED_AT" in header),
     }
 
     if not cfg["handle"]:
@@ -569,66 +658,143 @@ def refresh_account_config():
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  CROSS-REPO SOFT LOCK
+#  AUTO ACCOUNT-ROW ASSIGNMENT (one short transaction: scan + claim)
+# ═══════════════════════════════════════════════════════════════════════════
+
+def resolve_account_row():
+    explicit = get_env("ACCOUNT_ROW", required=False)
+    if explicit:
+        row = _parse_int(explicit, 1)
+        print(f"ACCOUNT_ROW={row} was explicitly set — using it as a manual override "
+              f"(auto-assignment skipped).")
+        return row
+
+    def _mut(wb):
+        ws = wb[CREDS_TAB]
+        header = ws_header_map(ws)
+
+        def hidx(*names):
+            for n in names:
+                if n.upper() in header:
+                    return header[n.upper()]
+            return None
+
+        handle_col = hidx("BSKY_HANDLE")
+        repo_col   = hidx("ASSIGNED_REPO")
+        status_col = hidx("ASSIGNED_STATUS")
+        at_col     = hidx("ASSIGNED_AT")
+
+        if handle_col is None or repo_col is None or status_col is None:
+            raise RuntimeError(
+                f"Auto row-assignment needs 'BSKY_HANDLE', 'ASSIGNED_REPO' and "
+                f"'ASSIGNED_STATUS' columns in '{CREDS_TAB}'. Add any missing ones "
+                f"to the header row, or set ACCOUNT_ROW manually for this run."
+            )
+
+        max_row = ws.max_row
+
+        for excel_row in range(2, max_row + 1):
+            if ws_cell(ws, excel_row, repo_col) == CURRENT_REPO:
+                handle = ws_cell(ws, excel_row, handle_col)
+                data_idx = excel_row - 1
+                print(f"Repo '{CURRENT_REPO}' already owns Credentials row {data_idx} "
+                      f"({handle or 'no handle'}) — reusing it.")
+                return False, data_idx
+
+        for excel_row in range(2, max_row + 1):
+            handle_val = ws_cell(ws, excel_row, handle_col)
+            status_val = ws_cell(ws, excel_row, status_col)
+            if not handle_val:
+                continue
+            if status_val.lower() == ASSIGN_STATUS_IN_USE.lower():
+                continue
+
+            now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            ws_set_cell(ws, excel_row, repo_col, CURRENT_REPO)
+            ws_set_cell(ws, excel_row, status_col, ASSIGN_STATUS_IN_USE)
+            if at_col is not None:
+                ws_set_cell(ws, excel_row, at_col, now)
+            data_idx = excel_row - 1
+            print(f"Claimed Credentials row {data_idx} ({handle_val}) for repo '{CURRENT_REPO}'.")
+            return True, data_idx
+
+        raise RuntimeError(
+            f"No available account rows left in '{CREDS_TAB}' — every configured "
+            f"row is already marked '{ASSIGN_STATUS_IN_USE}'. Add a new account "
+            f"row, or clear ASSIGNED_REPO/ASSIGNED_STATUS on one you want to free up."
+        )
+
+    return STORE.transact(_mut)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  CROSS-REPO SOFT LOCK (business-level "who owns this account row right now")
 # ═══════════════════════════════════════════════════════════════════════════
 
 class AccountLockedElsewhereError(Exception):
     """Non-fatal — another repo currently owns this account row."""
 
 
-def _write_lock_heartbeat(owner, ts):
-    global _account_config
-    try:
-        tab = SheetTab(CREDS_TAB)
-        excel_row = ACCOUNT_ROW + 1
-        if _creds_lock_col_by is not None:
-            tab.set_cell(excel_row, _creds_lock_col_by, owner)
-        if _creds_lock_col_at is not None:
-            tab.set_cell(excel_row, _creds_lock_col_at, ts)
-        if _account_config:
-            _account_config["locked_by"] = owner
-            _account_config["locked_at"] = ts
-    except Exception as exc:
-        print(f"Warning: could not write account lock heartbeat: {exc}")
-
-
 def try_acquire_account_lock():
-    cfg = refresh_account_config()
+    global _account_config
 
-    if _creds_lock_col_by is None or _creds_lock_col_at is None:
-        return True
+    def _mut(wb):
+        ws = wb[CREDS_TAB]
+        header = ws_header_map(ws)
+        by_col = header.get("LOCKED_BY")
+        at_col = header.get("LOCKED_AT")
+        excel_row = ACCOUNT_ROW + 1
 
-    locked_by     = cfg.get("locked_by", "")
-    locked_at_raw = cfg.get("locked_at", "")
+        if by_col is None or at_col is None:
+            return False, True   # no lock columns configured -> treat as always acquired
 
-    stale = True
-    if locked_at_raw:
-        try:
-            locked_at = time.mktime(time.strptime(locked_at_raw, "%Y-%m-%dT%H:%M:%SZ"))
-            stale = (time.time() - locked_at) > LOCK_TTL_MINUTES * 60
-        except ValueError:
-            stale = True
+        locked_by     = ws_cell(ws, excel_row, by_col)
+        locked_at_raw = ws_cell(ws, excel_row, at_col)
 
-    if locked_by and locked_by != CURRENT_REPO and not stale:
-        print(f"Row {ACCOUNT_ROW} is currently locked by '{locked_by}' "
-              f"(last heartbeat {locked_at_raw} UTC, TTL {LOCK_TTL_MINUTES}m). Skipping this run.")
-        return False
+        stale = True
+        if locked_at_raw:
+            try:
+                locked_at = time.mktime(time.strptime(locked_at_raw, "%Y-%m-%dT%H:%M:%SZ"))
+                stale = (time.time() - locked_at) > LOCK_TTL_MINUTES * 60
+            except ValueError:
+                stale = True
 
-    _write_lock_heartbeat(CURRENT_REPO, time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
-    return True
+        if locked_by and locked_by != CURRENT_REPO and not stale:
+            print(f"Row {ACCOUNT_ROW} is currently locked by '{locked_by}' "
+                  f"(last heartbeat {locked_at_raw} UTC, TTL {LOCK_TTL_MINUTES}m). Skipping this run.")
+            return False, False
+
+        now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        ws_set_cell(ws, excel_row, by_col, CURRENT_REPO)
+        ws_set_cell(ws, excel_row, at_col, now)
+        if _account_config:
+            _account_config["locked_by"] = CURRENT_REPO
+            _account_config["locked_at"] = now
+        return True, True
+
+    refresh_account_config()
+    return STORE.transact(_mut)
 
 
 def _write_account_status(status):
     global _account_config
-    if _creds_status_col is None:
-        print("Note: no ACCOUNT_STATUS column in Credentials — add one to track per-row status.")
-        return
-    try:
-        tab = SheetTab(CREDS_TAB)
+
+    def _mut(wb):
+        ws = wb[CREDS_TAB]
+        header = ws_header_map(ws)
+        status_col = header.get("ACCOUNT_STATUS")
+        if status_col is None:
+            print("Note: no ACCOUNT_STATUS column in Credentials — add one to track per-row status.")
+            return False, None
+        at_col = header.get("ACCOUNT_STATUS_AT")
         excel_row = ACCOUNT_ROW + 1
-        tab.set_cell(excel_row, _creds_status_col, status)
-        if _creds_status_at_col is not None:
-            tab.set_cell(excel_row, _creds_status_at_col, _now_str())
+        ws_set_cell(ws, excel_row, status_col, status)
+        if at_col is not None:
+            ws_set_cell(ws, excel_row, at_col, _now_str())
+        return True, None
+
+    try:
+        STORE.transact(_mut)
         if _account_config:
             _account_config["account_status"] = status
         print(f"Credentials ACCOUNT_STATUS set to '{status}' for row {ACCOUNT_ROW}.")
@@ -657,7 +823,7 @@ def replace_urls(text):
 
 def print_config_summary():
     cfg = _cfg()
-    print("── Run config (live from Settings + Credentials in Google Sheet) ──")
+    print("── Run config (live from Settings + Credentials in the Mega workbook) ──")
     print(f"  Account row:              {cfg['row_num']}  ({_posting_handle()})")
     print(f"  Account status:           {cfg.get('account_status') or '(not set)'}")
     print(f"  Mega upload folder:       {cfg['mega_upload_folder'] or '(not set!)'}")
@@ -684,12 +850,14 @@ def print_config_summary():
         print(f"  Scan last N posts:        {cfg['top_posts_within']}")
     print(f"  Post-plan sheet (media):  {cfg['post_plan_sheet_name']}")
     print(f"  LinkPlan sheet:           {cfg['link_plan_sheet_name']}")
-    print(f"  Config source:            Google Sheet ({SPREADSHEET_ID})")
-    if _creds_lock_col_by is not None:
+    print(f"  Config source:            Mega workbook ({STATE_REMOTE_FULL})")
+    if cfg.get("has_lock_columns"):
         print(f"  Cross-repo lock:          enabled (owner={cfg.get('locked_by') or '—'}, "
               f"last heartbeat={cfg.get('locked_at') or '—'})")
     else:
         print("  Cross-repo lock:          disabled (add LOCKED_BY / LOCKED_AT columns to enable)")
+    print(f"  Workbook lock TTL:        {WORKBOOK_LOCK_TTL_SECONDS}s "
+          f"(acquire timeout {WORKBOOK_LOCK_ACQUIRE_TIMEOUT_SECONDS}s)")
     print("─────────────────────────────────────────────────")
 
 
@@ -708,16 +876,19 @@ def _parse_report_ts(s):
 
 
 def _last_report_for_handle(handle):
-    tab = SheetTab(REPORT_TAB)
-    rows = tab.rows(force=True)
-    for i in range(len(rows), 1, -1):
-        row = rows[i - 1]
-        if len(row) > 1 and str(row[1]).strip() == handle:
-            ts = str(row[0]).strip() if row[0] else ""
+    wb = STORE.snapshot()
+    if REPORT_TAB not in wb.sheetnames:
+        return None, None
+    ws = wb[REPORT_TAB]
+    for r in range(ws.max_row, 1, -1):
+        h = ws_cell(ws, r, 2)
+        if h == handle:
+            ts = ws_cell(ws, r, 1)
             followers = None
-            if len(row) > 2 and row[2]:
+            f_raw = ws_cell(ws, r, 3)
+            if f_raw:
                 try:
-                    followers = int(str(row[2]).strip())
+                    followers = int(f_raw)
                 except ValueError:
                     followers = None
             return ts, followers
@@ -737,10 +908,16 @@ def _report_due(handle, times_per_day):
 
 
 def _append_report(rows):
-    ensure_tab(REPORT_TAB, header=REPORT_HEADER)
-    tab = SheetTab(REPORT_TAB)
-    for row in rows:
-        tab.append_row(row)
+    def _mut(wb):
+        if REPORT_TAB not in wb.sheetnames:
+            ws = wb.create_sheet(REPORT_TAB)
+            ws.append(REPORT_HEADER)
+        else:
+            ws = wb[REPORT_TAB]
+        for row in rows:
+            ws.append(row)
+        return True, None
+    STORE.transact(_mut)
 
 
 def _top_post_summary(client, handle, top_n, within):
@@ -786,6 +963,8 @@ def _top_post_summary(client, handle, top_n, within):
 
 
 def generate_report(client, handle, cfg):
+    """All Bluesky API calls happen with NO lock held; only the final
+    `_append_report` touches the workbook lock, and only briefly."""
     if not _report_due(handle, cfg["report_times_per_day"]):
         print(f"Report for {handle} not due yet (limit: {cfg['report_times_per_day']}x/24h).")
         return
@@ -892,7 +1071,8 @@ def choose_media_kind():
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  POST-PLAN SHEET (File Name + Caption + Status)
+#  POST-PLAN SHEET (File Name + Caption + Status) — reads are unlocked,
+#  the only write (mark_posted) is a short transaction.
 # ═══════════════════════════════════════════════════════════════════════════
 
 _post_plan_cache          = None
@@ -909,19 +1089,15 @@ def load_post_plan(force_refresh=False):
         return _post_plan_cache
 
     tab_name = get_post_plan_tab_name()
-    tab = SheetTab(tab_name)
-    try:
-        rows = tab.rows(force=force_refresh)
-    except Exception as exc:
-        print(f"Warning: post-plan sheet '{tab_name}' not found or unreadable ({exc}).")
-        _post_plan_cache = {}
-        return _post_plan_cache
-    if not rows:
-        print(f"Warning: post-plan sheet '{tab_name}' is empty.")
+    wb = STORE.snapshot()
+    if tab_name not in wb.sheetnames:
+        print(f"Warning: post-plan sheet '{tab_name}' not found in the workbook — "
+              f"add a tab with that name (File Name / Caption / Status columns).")
         _post_plan_cache = {}
         return _post_plan_cache
 
-    header = tab.header_map()
+    ws = wb[tab_name]
+    header = ws_header_map(ws)
 
     def ci(*names):
         for n in names:
@@ -944,10 +1120,10 @@ def load_post_plan(force_refresh=False):
     plan_exact = {}
     plan_lower = {}
     already    = 0
-    for excel_row in range(2, tab.max_row() + 1):
-        fname   = tab.cell(excel_row, file_idx)
-        caption = tab.cell(excel_row, caption_idx)
-        status  = tab.cell(excel_row, status_idx) if status_idx else ""
+    for excel_row in range(2, ws.max_row + 1):
+        fname   = ws_cell(ws, excel_row, file_idx)
+        caption = ws_cell(ws, excel_row, caption_idx)
+        status  = ws_cell(ws, excel_row, status_idx) if status_idx else ""
         if not fname:
             continue
         entry = {"caption": caption, "row": excel_row, "status": status}
@@ -976,10 +1152,17 @@ def mark_posted(filename, row_number, retries=3):
     if _post_plan_status_col_idx is None:
         print(f"Warning: no 'Status' column — cannot mark '{filename}' as posted.")
         return
-    tab = SheetTab(get_post_plan_tab_name())
+
+    tab_name = get_post_plan_tab_name()
+
+    def _mut(wb):
+        ws = wb[tab_name]
+        ws_set_cell(ws, row_number, _post_plan_status_col_idx, POSTED_STATUS_VALUE)
+        return True, None
+
     for attempt in range(1, retries + 1):
         try:
-            tab.set_cell(row_number, _post_plan_status_col_idx, POSTED_STATUS_VALUE)
+            STORE.transact(_mut)
             if _post_plan_cache:
                 for d in (_post_plan_cache.get("exact", {}), _post_plan_cache.get("lower", {})):
                     for entry in d.values():
@@ -1007,15 +1190,12 @@ def get_link_plan_tab_name():
 
 def load_link_plan():
     tab_name = get_link_plan_tab_name()
-    tab = SheetTab(tab_name)
-    try:
-        rows = tab.rows(force=True)
-    except Exception:
-        return []
-    if not rows:
+    wb = STORE.snapshot()
+    if tab_name not in wb.sheetnames:
         return []
 
-    header = tab.header_map()
+    ws = wb[tab_name]
+    header = ws_header_map(ws)
 
     def ci(*names):
         for n in names:
@@ -1030,12 +1210,12 @@ def load_link_plan():
         raise RuntimeError(f"'{tab_name}' needs a 'URL' column.")
 
     out = []
-    for excel_row in range(2, tab.max_row() + 1):
-        url = tab.cell(excel_row, url_idx)
+    for excel_row in range(2, ws.max_row + 1):
+        url = ws_cell(ws, excel_row, url_idx)
         if not url:
             continue
-        caption = tab.cell(excel_row, cap_idx) if cap_idx else ""
-        status  = tab.cell(excel_row, status_idx) if status_idx else ""
+        caption = ws_cell(ws, excel_row, cap_idx) if cap_idx else ""
+        status  = ws_cell(ws, excel_row, status_idx) if status_idx else ""
         out.append({
             "url": url, "caption": caption, "status": status,
             "row": excel_row, "status_col": status_idx,
@@ -1056,27 +1236,45 @@ def pick_next_url():
 def claim_url_row(entry):
     if entry["status_col"] is None:
         return True
-    tab = SheetTab(get_link_plan_tab_name())
+    tab_name  = get_link_plan_tab_name()
     claim_val = f"{CLAIM_PREFIX}{RUN_TAG}"
-    tab.set_cell(entry["row"], entry["status_col"], claim_val)
-    # Re-read to confirm the claim stuck
-    tab.rows(force=True)
-    return tab.cell(entry["row"], entry["status_col"]) == claim_val
+
+    def _mut(wb):
+        ws = wb[tab_name]
+        current = ws_cell(ws, entry["row"], entry["status_col"])
+        if current.lower() == POSTED_STATUS_VALUE or current.lower().startswith(CLAIM_PREFIX.lower()):
+            return False, False   # someone else got there first
+        ws_set_cell(ws, entry["row"], entry["status_col"], claim_val)
+        return True, True
+
+    return STORE.transact(_mut)
 
 
 def mark_url_posted(entry):
     if entry["status_col"] is None:
         return
-    tab = SheetTab(get_link_plan_tab_name())
-    tab.set_cell(entry["row"], entry["status_col"], POSTED_STATUS_VALUE)
+    tab_name = get_link_plan_tab_name()
+
+    def _mut(wb):
+        ws = wb[tab_name]
+        ws_set_cell(ws, entry["row"], entry["status_col"], POSTED_STATUS_VALUE)
+        return True, None
+
+    STORE.transact(_mut)
 
 
 def release_url_claim(entry):
     if entry["status_col"] is None:
         return
+    tab_name = get_link_plan_tab_name()
+
+    def _mut(wb):
+        ws = wb[tab_name]
+        ws_set_cell(ws, entry["row"], entry["status_col"], "")
+        return True, None
+
     try:
-        tab = SheetTab(get_link_plan_tab_name())
-        tab.set_cell(entry["row"], entry["status_col"], "")
+        STORE.transact(_mut)
     except Exception as exc:
         print(f"Warning: could not release claim on LinkPlan row {entry['row']}: {exc}")
 
@@ -1508,9 +1706,14 @@ def post_to_bluesky(client, media_name, local_path, kind, caption, tags, add_lin
 # ═══════════════════════════════════════════════════════════════════════════
 
 def run_discover():
-    tab = SheetTab(CREDS_TAB)
-    tab.rows(force=True)
-    header = tab.header_map()
+    bootstrap_state()
+
+    wb = STORE.snapshot()
+    if CREDS_TAB not in wb.sheetnames:
+        print(f"::error::'{CREDS_TAB}' tab not found in the workbook.")
+        sys.exit(1)
+    ws = wb[CREDS_TAB]
+    header = ws_header_map(ws)
 
     def hidx(*names):
         for n in names:
@@ -1536,16 +1739,15 @@ def run_discover():
               f"(eligibility filter and MAX_ACCOUNTS_PER_RUN cap skipped).")
     else:
         eligible = []
-        for data_idx in range(1, tab.max_row()):
-            excel_row = data_idx + 1
-            handle = tab.cell(excel_row, handle_col)
+        for excel_row in range(2, ws.max_row + 1):
+            handle = ws_cell(ws, excel_row, handle_col)
             if not handle:
                 continue
-            status = tab.cell(excel_row, status_col).lower() if status_col else ""
+            status = ws_cell(ws, excel_row, status_col).lower() if status_col else ""
             if any(marker in status for marker in SKIP_STATUS_MARKERS):
-                print(f"Skipping row {data_idx} ({handle}) — status: {status!r}")
+                print(f"Skipping row {excel_row - 1} ({handle}) — status: {status!r}")
                 continue
-            eligible.append(data_idx)
+            eligible.append(excel_row - 1)
 
         if not eligible:
             print(f"::error::No eligible account rows in '{CREDS_TAB}' "
@@ -1696,7 +1898,7 @@ def run_once():
 def main():
     global ACCOUNT_ROW
     try:
-        ensure_tab(CREDS_TAB, header=CREDENTIALS_HEADER)
+        bootstrap_state()
         ensure_settings_defaults()
         ACCOUNT_ROW = resolve_account_row()
         load_account_config()
@@ -1706,8 +1908,8 @@ def main():
 
     print_config_summary()
     print(f"Starting loop. Loop interval and post-type mix are read from the "
-          f"Settings tab in the Google Sheet and re-checked at the start of every "
-          f"cycle — edit them there any time, no redeploy needed.")
+          f"Settings tab of the Mega workbook and re-checked at the start of "
+          f"every cycle — edit them there any time, no redeploy needed.")
 
     while True:
         cycle_start = time.time()
