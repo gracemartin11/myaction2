@@ -1,5 +1,4 @@
 name: Bluesky Auto Poster
-
 on:
   schedule:
     - cron: "0 */6 * * *"
@@ -8,22 +7,20 @@ on:
       account_row:
         description: >
           OPTIONAL. Leave blank to auto-run every eligible account row from
-          workflow.xlsx (up to MAX_ACCOUNTS_PER_RUN, if set). Fill in a single
-          row number to force this run onto just that one row.
+          the Credentials sheet (up to MAX_ACCOUNTS_PER_RUN, if set). Fill in
+          a single row number to force this run onto just that one row.
         required: false
         default: ""
       max_accounts:
         description: >
           OPTIONAL. Overrides the Settings-sheet MAX_ACCOUNTS_PER_RUN cap for
-          this run only. Leave blank to use the xlsx setting (or run every
+          this run only. Leave blank to use the sheet setting (or run every
           eligible account if that's blank too).
         required: false
         default: ""
-
 concurrency:
   group: bluesky-poster
   cancel-in-progress: false
-
 jobs:
   # ── Step 1: figure out which account rows run this time ──────────────────
   discover-accounts:
@@ -37,28 +34,15 @@ jobs:
         with:
           python-version: "3.11"
       - name: Install dependencies
-        run: pip install openpyxl atproto Pillow requests beautifulsoup4
-      - name: Install rclone
-        run: |
-          curl https://rclone.org/install.sh | sudo bash
-          rclone version
-      - name: Write rclone config (Mega)
-        run: echo "$MEGA_RCLONE_CONF" > rclone.conf
-        env:
-          MEGA_RCLONE_CONF: ${{ secrets.MEGA_RCLONE_CONF }}
+        run: pip install google-api-python-client google-auth atproto Pillow requests beautifulsoup4
       - name: Discover eligible accounts
         id: discover
         run: python -u postnow_status_post.py --discover
         env:
-          RCLONE_CONFIG_PATH: rclone.conf
-          RCLONE_REMOTE_NAME: mega
-          WORKFLOW_XLSX_PATH: ${{ secrets.WORKFLOW_XLSX_PATH || 'workflow.xlsx' }}
+          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
           FORCE_ACCOUNT_ROW: ${{ github.event.inputs.account_row }}
           MAX_ACCOUNTS_PER_RUN: ${{ github.event.inputs.max_accounts }}
-      - name: Clean up
-        if: always()
-        run: rm -f rclone.conf
-
   # ── Step 2: one job per eligible account, run in parallel ────────────────
   post:
     needs: discover-accounts
@@ -75,12 +59,12 @@ jobs:
         with:
           python-version: "3.11"
       - name: Install dependencies
-        run: pip install openpyxl atproto Pillow requests beautifulsoup4
+        run: pip install google-api-python-client google-auth atproto Pillow requests beautifulsoup4
       - name: Install rclone
         run: |
           curl https://rclone.org/install.sh | sudo bash
           rclone version
-      - name: Write rclone config (Mega)
+      - name: Write rclone config (Mega — media files only)
         run: echo "$MEGA_RCLONE_CONF" > rclone.conf
         env:
           MEGA_RCLONE_CONF: ${{ secrets.MEGA_RCLONE_CONF }}
@@ -90,7 +74,8 @@ jobs:
           PYTHONUNBUFFERED: "1"
           RCLONE_CONFIG_PATH: rclone.conf
           RCLONE_REMOTE_NAME: mega
-          WORKFLOW_XLSX_PATH: ${{ secrets.WORKFLOW_XLSX_PATH || 'workflow.xlsx' }}
+          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
           ACCOUNT_ROW: ${{ matrix.account_row }}
       - name: Clean up
         if: always()
