@@ -49,7 +49,7 @@ jobs:
         env:
           RCLONE_CONFIG_PATH: rclone.conf
           RCLONE_REMOTE_NAME: mega
-          MEGA_STATE_PATH: ${{ vars.MEGA_STATE_PATH }}   # e.g. AutoPoster/state.xlsx
+          MEGA_STATE_PATH: ${{ secrets.MEGA_STATE_PATH }}   # e.g. AutoPoster/state.xlsx
           FORCE_ACCOUNT_ROW: ${{ github.event.inputs.account_row }}
           MAX_ACCOUNTS_PER_RUN: ${{ github.event.inputs.max_accounts }}
       - name: Clean up
@@ -87,7 +87,7 @@ jobs:
           PYTHONUNBUFFERED: "1"
           RCLONE_CONFIG_PATH: rclone.conf
           RCLONE_REMOTE_NAME: mega
-          MEGA_STATE_PATH: ${{ vars.MEGA_STATE_PATH }}   # e.g. AutoPoster/state.xlsx
+          MEGA_STATE_PATH: ${{ secrets.MEGA_STATE_PATH }}   # e.g. AutoPoster/state.xlsx
           ACCOUNT_ROW: ${{ matrix.account_row }}
       - name: Clean up
         if: always()
