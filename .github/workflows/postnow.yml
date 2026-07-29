@@ -34,15 +34,28 @@ jobs:
         with:
           python-version: "3.11"
       - name: Install dependencies
-        run: pip install google-api-python-client google-auth atproto Pillow requests beautifulsoup4
+        run: pip install openpyxl atproto Pillow requests beautifulsoup4
+      - name: Install rclone
+        run: |
+          curl https://rclone.org/install.sh | sudo bash
+          rclone version
+      - name: Write rclone config (Mega — media + state workbook)
+        run: echo "$MEGA_RCLONE_CONF" > rclone.conf
+        env:
+          MEGA_RCLONE_CONF: ${{ secrets.MEGA_RCLONE_CONF }}
       - name: Discover eligible accounts
         id: discover
         run: python -u postnow_status_post.py --discover
         env:
-          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
-          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          RCLONE_CONFIG_PATH: rclone.conf
+          RCLONE_REMOTE_NAME: mega
+          MEGA_STATE_PATH: ${{ vars.MEGA_STATE_PATH }}   # e.g. AutoPoster/state.xlsx
           FORCE_ACCOUNT_ROW: ${{ github.event.inputs.account_row }}
           MAX_ACCOUNTS_PER_RUN: ${{ github.event.inputs.max_accounts }}
+      - name: Clean up
+        if: always()
+        run: rm -f rclone.conf
+
   # ── Step 2: one job per eligible account, run in parallel ────────────────
   post:
     needs: discover-accounts
@@ -59,12 +72,12 @@ jobs:
         with:
           python-version: "3.11"
       - name: Install dependencies
-        run: pip install google-api-python-client google-auth atproto Pillow requests beautifulsoup4
+        run: pip install openpyxl atproto Pillow requests beautifulsoup4
       - name: Install rclone
         run: |
           curl https://rclone.org/install.sh | sudo bash
           rclone version
-      - name: Write rclone config (Mega — media files only)
+      - name: Write rclone config (Mega — media + state workbook)
         run: echo "$MEGA_RCLONE_CONF" > rclone.conf
         env:
           MEGA_RCLONE_CONF: ${{ secrets.MEGA_RCLONE_CONF }}
@@ -74,8 +87,7 @@ jobs:
           PYTHONUNBUFFERED: "1"
           RCLONE_CONFIG_PATH: rclone.conf
           RCLONE_REMOTE_NAME: mega
-          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
-          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          MEGA_STATE_PATH: ${{ vars.MEGA_STATE_PATH }}   # e.g. AutoPoster/state.xlsx
           ACCOUNT_ROW: ${{ matrix.account_row }}
       - name: Clean up
         if: always()
